@@ -1,0 +1,22 @@
+# 运行时生成的数据库（含教师个人信息，不入库）
+skills/呼市实验中学成绩分析/data/
+
+# 本机安装元数据
+_user_meta.json
+_skillhub_meta.json
+_knot_meta.json
+_marketplace_meta.json
+_builtin_market_meta.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

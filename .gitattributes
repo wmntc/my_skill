@@ -1,0 +1,19 @@
+# 统一以 LF 存储，避免 Windows 的 core.autocrlf=true 改写脚本与配置
+* text=auto eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.txt text eol=lf
+
+# 二进制不做任何换行符转换
+*.ttf binary
+*.otf binary
+*.png binary
+*.webp binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.db binary
+*.pdf binary

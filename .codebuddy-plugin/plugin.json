@@ -1,0 +1,12 @@
+{
+  "name": "my_skill",
+  "version": "1.0",
+  "description": "个人技能集：教学设计生成、成果案例整理、成绩分析算分、公文格式排版四个 WorkBuddy Skill。",
+  "description_zh": "个人技能集：教学设计生成、成果案例整理、成绩分析算分、公文格式排版四个 WorkBuddy Skill。",
+  "description_en": "Personal skill collection: four WorkBuddy Skills for lesson-plan generation, achievement-case packaging, exam score analysis, and official document formatting.",
+  "author": {
+    "name": "wmntc"
+  },
+  "keywords": ["教学设计", "成果案例", "成绩分析", "公文排版", "skill"],
+  "category": "education"
+}
