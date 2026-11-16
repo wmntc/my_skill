@@ -40,6 +40,7 @@
   .exam-card .del:hover { background: #f9d6d3; }
   .tag { display: inline-block; font-size: 11px; background: var(--chip); color: var(--accent);
          border-radius: 6px; padding: 2px 7px; margin-left: 6px; }
+  .tag.first { background: #e8f7ef; color: var(--good); }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { border: 1px solid var(--line); padding: 7px 9px; text-align: center; }
   th { background: #f0f4fb; cursor: pointer; user-select: none; }
@@ -163,7 +164,7 @@ function renderExams() {
     const sel = state.selExams.includes(e.id);
     html += `<div class="exam-card ${sel ? 'sel' : ''}" data-id="${e.id}">
       <input type="checkbox" ${sel ? 'checked' : ''} />
-      <div style="flex:1"><div class="title">${e.exam_info || '(未命名考试)'}</div>
+      <div style="flex:1"><div class="title">${e.exam_info || '(未命名考试)'}${Number(e.exam_count)===1?'<span class="tag first">首次考试</span>':''}</div>
       <div class="meta">${e.exam_date || ''} · 班级 ${e.class_count} · 学科 ${e.subject_count} · 教师 ${e.teacher_count} · ${e.created_at}</div></div>
       <button class="del" data-id="${e.id}">删除</button>
     </div>`;
@@ -225,6 +226,8 @@ async function renderClass() {
   const main = document.getElementById('main');
   if (!state.selExams.length) { main.innerHTML = '<div class="empty">请先在「考试列表」勾选至少一次考试。</div>'; return; }
   const eid = state.selExams[0];
+  const primaryExam = state.exams.find(e => e.id === eid);
+  const isSingle = primaryExam && Number(primaryExam.exam_count) === 1;
   const subjects = await api('/api/subjects?exam_id=' + eid);
   if (!state.subject || !subjects.includes(state.subject)) state.subject = subjects[0];
   const metrics = await api('/api/class_metrics?exam_id=' + eid + '&subject=' + encodeURIComponent(state.subject));
@@ -235,17 +238,30 @@ async function renderClass() {
 
   let html = '<div class="panel"><div class="row"><label>考试科目</label>'
     + '<select id="subj">' + subjects.map(s => `<option ${s===state.subject?'selected':''}>${s}</option>`).join('') + '</select>'
-    + '<span class="meta">主考试：' + (state.exams.find(e=>e.id===eid)?.exam_info||'') + '</span></div>';
+    + '<span class="meta">主考试：' + (primaryExam?.exam_info||'') + '</span>'
+    + (isSingle ? '<span class="tag first">首次考试 · 四项指标</span>' : '<span class="tag">两场对比 · 六项指标</span>')
+    + '</div>';
 
-  // 通用指标条形图（横向 3 列，6 张图排成 2 行更整齐）
-  // 「均分」为结果评价指标，其值即第二场班级均分（不做两场之差），与 T分差/正负 的进步幅度指标互补
+  // 通用指标条形图（横向 3 列）
   const sorted = [...metrics].sort((a,b)=>(b.均分||0)-(a.均分||0));
   html += '<div class="grid3">';
   html += '<div>' + barChart('均分', sorted, m=>m.均分, {labelFn:classLabel, d:1}) + '</div>';
-  html += '<div>' + barChart('T分差（第二场−第一场）', [...metrics].sort((a,b)=>(b.T分差||0)-(a.T分差||0)), m=>m.T分差, {labelFn:classLabel, signed:true, d:2}) + '</div>';
-  html += '<div>' + barChart('排名正负（正值=进步）', [...metrics].sort((a,b)=>(b.正负||0)-(a.正负||0)), m=>m.正负, {labelFn:classLabel, signed:true, d:2}) + '</div>';
-  html += '<div>' + barChart('优秀人数差（第二场−第一场）', [...metrics].sort((a,b)=>(b.优秀人数差||0)-(a.优秀人数差||0)), m=>m.优秀人数差, {labelFn:classLabel, signed:true, d:0}) + '</div>';
-  html += '<div>' + barChart('出库人数差', [...metrics].sort((a,b)=>(b.出库人数差||0)-(a.出库人数差||0)), m=>m.出库人数差, {labelFn:classLabel, signed:true, d:0}) + '</div>';
+  if (isSingle) {
+    // 单次考试（首次考试）：均分、优秀率、合格率、参考率 四项指标
+    // 「均分与排名」为同一项指标，排名不单列——排名即班级均分在同学科中的横向位次
+    html += '<div>' + barChart('优秀率（班级内达到优秀线人数占比）',
+      [...metrics].sort((a,b)=>(b.优秀率||-1)-(a.优秀率||-1)), m=>m.优秀率,
+      {labelFn:classLabel, d:4}) + '</div>';
+    html += '<div>' + barChart('合格率（班级内达到合格线人数占比）',
+      [...metrics].sort((a,b)=>(b.合格率||-1)-(a.合格率||-1)), m=>m.合格率,
+      {labelFn:classLabel, d:4}) + '</div>';
+  } else {
+    // 两场考试对比：均分、T分差、排名正负、优秀人数差、出库人数差、参考率
+    html += '<div>' + barChart('T分差（第二场−第一场）', [...metrics].sort((a,b)=>(b.T分差||0)-(a.T分差||0)), m=>m.T分差, {labelFn:classLabel, signed:true, d:2}) + '</div>';
+    html += '<div>' + barChart('排名正负（正值=进步）', [...metrics].sort((a,b)=>(b.正负||0)-(a.正负||0)), m=>m.正负, {labelFn:classLabel, signed:true, d:2}) + '</div>';
+    html += '<div>' + barChart('优秀人数差（第二场−第一场）', [...metrics].sort((a,b)=>(b.优秀人数差||0)-(a.优秀人数差||0)), m=>m.优秀人数差, {labelFn:classLabel, signed:true, d:0}) + '</div>';
+    html += '<div>' + barChart('出库人数差', [...metrics].sort((a,b)=>(b.出库人数差||0)-(a.出库人数差||0)), m=>m.出库人数差, {labelFn:classLabel, signed:true, d:0}) + '</div>';
+  }
   html += '<div>' + barChart('参考率', [...metrics].sort((a,b)=>(b.参考率||0)-(a.参考率||0)), m=>m.参考率, {labelFn:classLabel, d:4}) + '</div>';
   html += '</div>';
 
@@ -259,19 +275,33 @@ async function renderClass() {
   }
 
   // 明细表
-  html += '<div class="panel"><h2>班级指标明细（' + state.subject + '）</h2><table><thead><tr>'
-    + ['班级','校区','均分1','均分','T分差','正负','优秀差','出库差','参考率'].map(h=>`<th>${h}</th>`).join('')
-    + '</tr></thead><tbody>';
-  metrics.sort((a,b)=>(b.均分||0)-(a.均分||0)).forEach(m => {
-    html += `<tr><td>${m.班级}</td><td>${m.campus||'-'}</td><td>${fmt(m.均分1,1)}</td>`
-      + `<td><b>${fmt(m.均分,1)}</b></td>`
-      + `<td class="${m.T分差>=0?'pos':'neg'}">${fmt(m.T分差,2)}</td>`
-      + `<td class="${m.正负>=0?'pos':'neg'}">${fmt(m.正负,2)}</td>`
-      + `<td class="${m.优秀人数差>=0?'pos':'neg'}">${m.优秀人数差}</td>`
-      + `<td class="${m.出库人数差>=0?'pos':'neg'}">${m.出库人数差}</td>`
-      + `<td>${fmt(m.参考率,4)}</td></tr>`;
-  });
-  html += '</tbody></table></div></div>';
+  if (isSingle) {
+    html += '<div class="panel"><h2>班级指标明细（' + state.subject + '）</h2><table><thead><tr>'
+      + ['班级','校区','教师','均分','优秀率','合格率','参考率'].map(h=>`<th>${h}</th>`).join('')
+      + '</tr></thead><tbody>';
+    metrics.sort((a,b)=>(b.均分||0)-(a.均分||0)).forEach(m => {
+      html += `<tr><td>${m.班级}</td><td>${m.campus||'-'}</td><td>${m.教师姓名||'-'}</td>`
+        + `<td><b>${fmt(m.均分,1)}</b></td>`
+        + `<td>${fmt(m.优秀率,4)}</td>`
+        + `<td>${fmt(m.合格率,4)}</td>`
+        + `<td>${fmt(m.参考率,4)}</td></tr>`;
+    });
+    html += '</tbody></table></div></div>';
+  } else {
+    html += '<div class="panel"><h2>班级指标明细（' + state.subject + '）</h2><table><thead><tr>'
+      + ['班级','校区','均分1','均分','T分差','正负','优秀差','出库差','参考率'].map(h=>`<th>${h}</th>`).join('')
+      + '</tr></thead><tbody>';
+    metrics.sort((a,b)=>(b.均分||0)-(a.均分||0)).forEach(m => {
+      html += `<tr><td>${m.班级}</td><td>${m.campus||'-'}</td><td>${fmt(m.均分1,1)}</td>`
+        + `<td><b>${fmt(m.均分,1)}</b></td>`
+        + `<td class="${m.T分差>=0?'pos':'neg'}">${fmt(m.T分差,2)}</td>`
+        + `<td class="${m.正负>=0?'pos':'neg'}">${fmt(m.正负,2)}</td>`
+        + `<td class="${m.优秀人数差>=0?'pos':'neg'}">${m.优秀人数差}</td>`
+        + `<td class="${m.出库人数差>=0?'pos':'neg'}">${m.出库人数差}</td>`
+        + `<td>${fmt(m.参考率,4)}</td></tr>`;
+    });
+    html += '</tbody></table></div></div>';
+  }
   main.innerHTML = html;
 
   document.getElementById('subj').onchange = e => { state.subject = e.target.value; renderClass(); };
@@ -288,9 +318,15 @@ async function drawTrend(cls, label) {
   const labels = data.exam_info_list;
   const s = data.series[cls] || [];
   const nm = label || cls;
-  // 「均分」（结果评价，其值即第二场班级均分，不做差）与 T分差（进步幅度）各做一条
+  // 「均分」（结果评价）两种模式都可用；T分差仅两场考试有值
   box.innerHTML = lineChart(nm + ' · 均分走势', labels, [{name: nm, values: s.map(x=>x.均分)}]);
-  box.innerHTML += lineChart(nm + ' · T分差走势', labels, [{name: nm, values: s.map(x=>x.T分差)}]);
+  if (s.some(x => x.T分差 !== null && x.T分差 !== undefined)) {
+    box.innerHTML += lineChart(nm + ' · T分差走势', labels, [{name: nm, values: s.map(x=>x.T分差)}]);
+  }
+  if (s.some(x => x.优秀率 !== null && x.优秀率 !== undefined)) {
+    box.innerHTML += lineChart(nm + ' · 优秀率走势', labels, [{name: nm, values: s.map(x=>x.优秀率)}]);
+    box.innerHTML += lineChart(nm + ' · 合格率走势', labels, [{name: nm, values: s.map(x=>x.合格率)}]);
+  }
 }
 
 /* ---------- SVG 折线图（纯原生） ---------- */
@@ -331,28 +367,47 @@ async function renderCampus() {
   const main = document.getElementById('main');
   if (!state.selExams.length) { main.innerHTML = '<div class="empty">请先在「考试列表」勾选至少一次考试。</div>'; return; }
   const eid = state.selExams[0];
+  const primaryExam = state.exams.find(e => e.id === eid);
+  const isSingle = primaryExam && Number(primaryExam.exam_count) === 1;
   const subjects = await api('/api/subjects?exam_id=' + eid);
   if (!state.subject || !subjects.includes(state.subject)) state.subject = subjects[0];
   const rows = await api('/api/campus?exam_id=' + eid + '&subject=' + encodeURIComponent(state.subject));
   let html = '<div class="panel"><div class="row"><label>考试科目</label>'
-    + '<select id="subj2">' + subjects.map(s => `<option ${s===state.subject?'selected':''}>${s}</option>`).join('') + '</select></div>';
+    + '<select id="subj2">' + subjects.map(s => `<option ${s===state.subject?'selected':''}>${s}</option>`).join('') + '</select>'
+    + (isSingle ? '<span class="tag first">首次考试</span>' : '') + '</div>';
   if (!rows.length) html += '<div class="empty">该考试无校区信息（教师任课表需含「校区」列）。</div>';
   else {
     const campusLabel = r=>(r.校区||r.campus||'(未标注)');
     html += barChart('校区 · 平均均分', rows, r=>r.平均均分, {labelFn:campusLabel, d:1});
-    html += barChart('校区 · 平均T分差', rows, r=>r.平均T分差, {labelFn:campusLabel, signed:true, d:2});
-    html += barChart('校区 · 优秀人数差合计', rows, r=>r.优秀人数差合计, {labelFn:campusLabel, signed:true, d:0});
-    html += barChart('校区 · 出库人数差合计', rows, r=>r.出库人数差合计, {labelFn:campusLabel, signed:true, d:0});
+    if (isSingle) {
+      html += barChart('校区 · 平均优秀率', rows, r=>r.平均优秀率, {labelFn:campusLabel, d:4});
+      html += barChart('校区 · 平均合格率', rows, r=>r.平均合格率, {labelFn:campusLabel, d:4});
+    } else {
+      html += barChart('校区 · 平均T分差', rows, r=>r.平均T分差, {labelFn:campusLabel, signed:true, d:2});
+      html += barChart('校区 · 优秀人数差合计', rows, r=>r.优秀人数差合计, {labelFn:campusLabel, signed:true, d:0});
+      html += barChart('校区 · 出库人数差合计', rows, r=>r.出库人数差合计, {labelFn:campusLabel, signed:true, d:0});
+    }
     html += barChart('校区 · 平均参考率', rows, r=>r.平均参考率, {labelFn:campusLabel, d:4});
-    html += '<table style="margin-top:14px"><thead><tr>'
-      + ['校区','班级数','平均均分','平均T分差','优秀差合计','出库差合计','平均参考率'].map(h=>`<th>${h}</th>`).join('')
-      + '</tr></thead><tbody>';
-    rows.forEach(r=>{ html += `<tr><td>${r.校区||'(未标注)'}</td><td>${r.班级数}</td>`
-      + `<td><b>${fmt(r.平均均分,1)}</b></td>`
-      + `<td class="${r.平均T分差>=0?'pos':'neg'}">${fmt(r.平均T分差,2)}</td>`
-      + `<td class="${r.优秀人数差合计>=0?'pos':'neg'}">${r.优秀人数差合计}</td>`
-      + `<td class="${r.出库人数差合计>=0?'pos':'neg'}">${r.出库人数差合计}</td>`
-      + `<td>${fmt(r.平均参考率,4)}</td></tr>`; });
+    if (isSingle) {
+      html += '<table style="margin-top:14px"><thead><tr>'
+        + ['校区','班级数','平均均分','平均优秀率','平均合格率','平均参考率'].map(h=>`<th>${h}</th>`).join('')
+        + '</tr></thead><tbody>';
+      rows.forEach(r=>{ html += `<tr><td>${r.校区||'(未标注)'}</td><td>${r.班级数}</td>`
+        + `<td><b>${fmt(r.平均均分,1)}</b></td>`
+        + `<td>${fmt(r.平均优秀率,4)}</td>`
+        + `<td>${fmt(r.平均合格率,4)}</td>`
+        + `<td>${fmt(r.平均参考率,4)}</td></tr>`; });
+    } else {
+      html += '<table style="margin-top:14px"><thead><tr>'
+        + ['校区','班级数','平均均分','平均T分差','优秀差合计','出库差合计','平均参考率'].map(h=>`<th>${h}</th>`).join('')
+        + '</tr></thead><tbody>';
+      rows.forEach(r=>{ html += `<tr><td>${r.校区||'(未标注)'}</td><td>${r.班级数}</td>`
+        + `<td><b>${fmt(r.平均均分,1)}</b></td>`
+        + `<td class="${r.平均T分差>=0?'pos':'neg'}">${fmt(r.平均T分差,2)}</td>`
+        + `<td class="${r.优秀人数差合计>=0?'pos':'neg'}">${r.优秀人数差合计}</td>`
+        + `<td class="${r.出库人数差合计>=0?'pos':'neg'}">${r.出库人数差合计}</td>`
+        + `<td>${fmt(r.平均参考率,4)}</td></tr>`; });
+    }
     html += '</tbody></table>';
   }
   html += '</div>';
@@ -365,10 +420,16 @@ async function renderTeacher() {
   const main = document.getElementById('main');
   if (!state.selExams.length) { main.innerHTML = '<div class="empty">请先在「考试列表」勾选至少一次考试。</div>'; return; }
   const eid = state.selExams[0];
+  const primaryExam = state.exams.find(e => e.id === eid);
+  const isSingle = primaryExam && Number(primaryExam.exam_count) === 1;
   const rows = await api('/api/teacher_scores?exam_id=' + eid);
   if (!rows.length) { main.innerHTML = '<div class="empty">该考试无教师得分数据。</div>'; return; }
-  const cols = [['姓名','姓名'],['科目','科目'],['校区','校区'],['排名正负','排名正负'],['T分差','T分差'],['均分','均分'],['优秀人数','优秀人数'],['出库人数','出库人数'],['参考率','参考率'],['总分','总分']];
-  let html = '<div class="panel"><h2>教师得分表</h2><div style="overflow:auto"><table id="tt"><thead><tr>'
+  const cols = isSingle
+    ? [['姓名','姓名'],['科目','科目'],['校区','校区'],['均分','均分'],['优秀率','优秀率'],['合格率','合格率'],['参考率','参考率'],['总分','总分']]
+    : [['姓名','姓名'],['科目','科目'],['校区','校区'],['排名正负','排名正负'],['T分差','T分差'],['均分','均分'],['优秀人数','优秀人数'],['出库人数','出库人数'],['参考率','参考率'],['总分','总分']];
+  let html = '<div class="panel"><h2>教师得分表</h2>'
+    + (isSingle ? '<p class="meta" style="font-size:12px;color:var(--muted)">首次考试口径：均分 / 优秀率 / 合格率 / 参考率 四项加权</p>' : '')
+    + '<div style="overflow:auto"><table id="tt"><thead><tr>'
     + cols.map(c=>`<th data-k="${c[1]}">${c[0]}</th>`).join('') + '</tr></thead><tbody>';
   rows.forEach(r=>{
     html += '<tr>' + cols.map(c=>{
@@ -376,7 +437,7 @@ async function renderTeacher() {
       if (c[1]==='总分') return `<td><b>${fmt(v,2)}</b></td>`;
       if (['排名正负','T分差','优秀人数','出库人数'].includes(c[1])) return `<td class="${v>=0?'pos':'neg'}">${fmt(v, 2)}</td>`;
       if (c[1]==='均分') return `<td><b>${fmt(v,1)}</b></td>`;
-      if (c[1]==='参考率') return `<td>${fmt(v,4)}</td>`;
+      if (['参考率','优秀率','合格率'].includes(c[1])) return `<td>${fmt(v,4)}</td>`;
       return `<td>${v??'-'}</td>`;
     }).join('') + '</tr>';
   });

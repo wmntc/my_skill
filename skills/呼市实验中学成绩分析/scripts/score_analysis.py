@@ -2,9 +2,16 @@
 """
 考试成绩分析与教师绩效算分脚本（命令行版）
 
-功能：读取包含「成绩表」和「教师任课表」的 Excel 文件，对比两场考试，
-按班级计算六项指标（排名正负、T分差、均分、优秀人数差、出库人数差、参考率），
-并按可配置权重生成教师得分表，最终导出多工作表的结果 Excel。
+功能：读取包含「成绩表」和「教师任课表」的 Excel 文件，按班级计算指标并按可配置权重
+生成教师得分表，最终导出多工作表的结果 Excel。分两种模式：
+
+  · 两场考试对比（默认，--exam-count 2）：六项指标
+    排名正负 / T分差 / 均分 / 优秀人数差 / 出库人数差 / 参考率
+  · 单次考试·首次考试（--exam-count 1）：四项指标
+    均分 / 优秀率 / 合格率 / 参考率（均分与排名合为一项，排名不单列）
+    均分 + 排名 / 优秀率 / 合格率 / 参考率
+
+场次默认按成绩表列名自动识别（存在 '2' 结尾的科目列即为两场考试）。
 
 用法示例：
     python score_analysis.py -i 成绩数据.xlsx -o 分析结果.xlsx \
@@ -12,6 +19,12 @@
         --rank-weight 20 --t-diff-weight 20 --avg-weight 20 \
         --excellent-weight 15 --qualified-weight 15 --reference-weight 10 \
         --exam-date 2026-01-15 --cohort 2028 --semester 1 --exam-name 期末考试
+
+    python score_analysis.py -i 首次考试.xlsx -o 首次考试结果.xlsx --exam-count 1 \
+        --excellent-ratio 20 --qualified-ratio 80 \
+        --avg-weight 60 \
+        --excellent-weight 15 --qualified-weight 15 --reference-weight 10 \
+        --exam-date 2026-11-10 --cohort 2026 --semester 1 --exam-name 第一次期中考试
 """
 
 import argparse
@@ -29,9 +42,34 @@ T_SCORE_AVG = 50          # T分平均分
 T_SCORE_STD = 10          # T分标准差
 BASIC_COLUMNS = ["考号", "姓名", "集团班级"]
 
+# 两种分析模式的默认参数
+#   两场考试（六项指标）：排名正负 / T分差 / 均分 / 优秀人数 / 出库人数 / 参考率
+#   单次考试（四项指标）：均分 / 优秀率 / 合格率 / 参考率
+#     （「均分与排名」视为同一项指标：排名本就是班级均分的横向位次，不单列，
+#       故均分项合并了原「均分 25 + 排名 15」的权重，合计 60）
+DUAL_DEFAULT_WEIGHTS = {
+    "rank": 20.0, "t_diff": 20.0, "avg": 20.0,
+    "excellent": 15.0, "qualified": 15.0, "reference": 10.0,
+}
+SINGLE_DEFAULT_WEIGHTS = {
+    "avg": 60.0, "excellent": 15.0, "qualified": 15.0, "reference": 10.0,
+}
+DUAL_DEFAULT_RATIOS = {"excellent": 20.0, "qualified": 75.0}
+SINGLE_DEFAULT_RATIOS = {"excellent": 20.0, "qualified": 80.0}
+
 # 技能目录与默认数据库路径
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(SKILL_DIR, "data", "analysis.db")
+
+
+def detect_exam_count(df: pd.DataFrame) -> int:
+    """
+    按成绩表列名判断考试场次数。
+
+    存在以 '2' 结尾的科目列（总分2 除外）→ 判为两场考试；否则判为单次考试（首次考试）。
+    """
+    has_second = any(col.endswith("2") and col != "总分2" for col in df.columns)
+    return 2 if has_second else 1
 
 
 def natural_sort_key(s):
@@ -99,6 +137,12 @@ def validate_and_transform_data(df: pd.DataFrame) -> Tuple[Dict[str, pd.DataFram
     if not subject_columns_1:
         raise ValueError("未找到第一次考试的科目列（以'1'结尾的列）")
 
+    if not subject_columns_2:
+        # 只指定了两场对比口径，但文件里根本没有第二场科目列 —— 多半是首次考试数据
+        raise ValueError(
+            "按两场考试对比处理，但成绩表中找不到任何第二场科目列（以'2'结尾的列）。"
+            "该文件看起来只有一次考试成绩，请改用首次考试口径：加上 --exam-count 1")
+
     process_log.append(f"识别到第一次考试科目列：{', '.join(subject_columns_1)}")
     process_log.append(f"识别到第二次考试科目列：{', '.join(subject_columns_2)}")
 
@@ -161,8 +205,78 @@ def validate_and_transform_data(df: pd.DataFrame) -> Tuple[Dict[str, pd.DataFram
     return parsed_data, process_log
 
 
-def parse_excel(path: str) -> Tuple[Dict, List[str]]:
-    """解析 Excel 文件，返回 (数据字典, 处理日志)"""
+def validate_and_transform_data_single(df: pd.DataFrame) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
+    """
+    校验并转换「单次考试」（首次考试）数据。
+
+    列名规则：
+      - 科目列以 '1' 结尾（与两场考试模板保持一致，如 语文1 / 数学1 / 总分1）；
+      - 也支持不带后缀的科目列（语文 / 数学 / 总分），此时以「非基本信息列」识别；
+      - 总分列缺失时按科目求和自动计算。
+
+    输出的每个科目 DataFrame 统一为：考号 / 姓名 / 集团班级 / 成绩 / 参考状态。
+    """
+    process_log = []
+
+    missing_columns = [col for col in BASIC_COLUMNS if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Excel 成绩表缺少必要的基本信息列：{', '.join(missing_columns)}")
+
+    df = df.copy()
+    df["集团班级"] = df["集团班级"].apply(normalize_class)
+    process_log.append(f"数据包含所有基本信息列：{', '.join(BASIC_COLUMNS)}")
+
+    subject_columns = [col for col in df.columns if col.endswith("1") and col != "总分1"]
+    has_suffix = True
+    if not subject_columns:
+        # 回退：使用不带后缀的科目列（语文 / 数学 …）
+        excluded = set(BASIC_COLUMNS) | {"总分", "总分1"}
+        subject_columns = [col for col in df.columns if col not in excluded]
+        has_suffix = False
+    if not subject_columns:
+        raise ValueError("未找到任何科目列（单次考试模式：科目列应带 '1' 后缀，或直接使用学科名）")
+
+    process_log.append(f"识别到科目列：{', '.join(subject_columns)}"
+                       + ("（带 1 后缀）" if has_suffix else "（无后缀）"))
+
+    parsed_data = {}
+    for col in subject_columns:
+        subject = col[:-1] if has_suffix else col
+        if subject in parsed_data:
+            process_log.append(f"警告：科目「{subject}」出现重复列（{col}），已跳过重复项")
+            continue
+        subject_df = df[BASIC_COLUMNS + [col]].rename(columns={col: "成绩"})
+        subject_df["成绩"] = pd.to_numeric(subject_df["成绩"], errors="coerce")
+        subject_df["参考状态"] = subject_df["成绩"].notna()
+        absent_count = len(subject_df) - int(subject_df["参考状态"].sum())
+        process_log.append(f"{subject}科目缺考人数：{absent_count}")
+        parsed_data[subject] = subject_df
+
+    # 总分数据
+    total_df = df[BASIC_COLUMNS].copy()
+    if "总分1" in df.columns:
+        total_df["成绩"] = df["总分1"]
+        process_log.append("使用预计算的总分1数据")
+    elif "总分" in df.columns:
+        total_df["成绩"] = df["总分"]
+        process_log.append("使用预计算的总分数据")
+    elif subject_columns:
+        total_df["成绩"] = df[subject_columns].apply(pd.to_numeric, errors="coerce").sum(
+            axis=1, skipna=True)
+        process_log.append("数据中没有总分列，已按科目求和计算总分")
+
+    total_df["成绩"] = pd.to_numeric(total_df["成绩"], errors="coerce")
+    total_df["参考状态"] = total_df["成绩"].notna()
+    parsed_data["总分"] = total_df
+    return parsed_data, process_log
+
+
+def parse_excel(path: str, exam_count: int = 0) -> Tuple[Dict, List[str], int]:
+    """
+    解析 Excel 文件，返回 (数据字典, 处理日志, 考试场次数)。
+
+    exam_count：0 = 自动识别（按列名判断场次）；1 = 单次考试；2 = 两场考试对比。
+    """
     process_log = [f"读取文件：{path}"]
     excel_file = pd.ExcelFile(path)
 
@@ -172,7 +286,16 @@ def parse_excel(path: str) -> Tuple[Dict, List[str]]:
     df = excel_file.parse(sheet_name="成绩表")
     process_log.append(f"成功解析成绩表，共读取{len(df)}行数据")
 
-    parsed_data, validation_log = validate_and_transform_data(df)
+    detected = detect_exam_count(df)
+    mode = detected if exam_count == 0 else exam_count
+    if exam_count != 0 and exam_count != detected:
+        process_log.append(f"注意：指定为 {exam_count} 场考试，按列名识别为 {detected} 场，以指定值为准")
+    process_log.append(f"分析模式：{'单次考试（首次考试，四项指标）' if mode == 1 else '两场考试对比（六项指标）'}")
+
+    if mode == 1:
+        parsed_data, validation_log = validate_and_transform_data_single(df)
+    else:
+        parsed_data, validation_log = validate_and_transform_data(df)
     process_log.extend(validation_log)
 
     if "教师任课表" in excel_file.sheet_names:
@@ -185,7 +308,7 @@ def parse_excel(path: str) -> Tuple[Dict, List[str]]:
         process_log.append("警告：未找到教师任课表，将不生成教师得分表")
         parsed_data["教师任课表"] = None
 
-    return parsed_data, process_log
+    return parsed_data, process_log, mode
 
 
 # ---------------- 指标计算 ----------------
@@ -401,6 +524,328 @@ def calc_reference_rate(df: pd.DataFrame, subject: str) -> Tuple[float, List[str
     reference_rate = (reference_count / total_students * 100) if total_students > 0 else 0.0
     return round(reference_rate, 1), [
         f"科目{subject}：整体参考率 = {reference_count}/{total_students} × 100% = {reference_rate:.1f}%"]
+
+
+# ---------------- 单次考试（首次考试）指标计算 ----------------
+def build_single_class_stats(df: pd.DataFrame, subject: str) -> pd.DataFrame:
+    """
+    单次考试的班级均分（含横向位次参考）。
+
+    - 均分：该班该科「有成绩学生」的平均分（缺考不计入平均）
+    - 排名：班级均分在同学科全部班级中的名次（1 = 最高，并列同名次）
+      —— 排名本就是班级均分的横向位次，与均分属同一项指标，不单独计分，仅作参考字段
+    - 线性排名：rank = 1 + (N-1)*(Xmax-x)/(Xmax-Xmin)，与既有「排名正负」口径一致
+    """
+    valid = df[(df["参考状态"]) & (df["成绩"].notna())].copy()
+
+    if valid.empty:
+        return pd.DataFrame(columns=["班级", "学科", "均分", "排名", "线性排名",
+                                     "总人数", "参考人数"])
+
+    grouped = valid.groupby("集团班级").agg(
+        均分=("成绩", "mean"), 参考人数=("成绩", "size")).reset_index()
+    grouped = grouped.rename(columns={"集团班级": "班级"})
+
+    roster = df.groupby("集团班级").size().reset_index(name="总人数")
+    roster = roster.rename(columns={"集团班级": "班级"})
+    grouped = pd.merge(grouped, roster, on="班级", how="left")
+    grouped["均分"] = grouped["均分"].round(2)
+
+    n_classes = len(grouped)
+    x_max, x_min = grouped["均分"].max(), grouped["均分"].min()
+    if x_max == x_min:
+        grouped["线性排名"] = 1.0
+    else:
+        grouped["线性排名"] = 1 + (n_classes - 1) * (
+            (x_max - grouped["均分"]) / (x_max - x_min))
+
+    grouped["排名"] = grouped["均分"].rank(ascending=False, method="min").astype(int)
+    grouped["线性排名"] = grouped["线性排名"].round(2)
+    grouped["学科"] = subject
+    return grouped.sort_values(by="班级", key=lambda x: x.apply(natural_sort_key))
+
+
+def calc_single_avg_rank(df: pd.DataFrame, subject: str) -> Tuple[Dict, List[str]]:
+    """单次考试：班级均分（附排名参考字段）"""
+    process_log = []
+    stats = build_single_class_stats(df, subject)
+
+    if stats.empty:
+        return {"均分排名表格": []}, [f"科目{subject}：无有效成绩记录"]
+
+    table = stats[["班级", "学科", "均分", "排名", "线性排名",
+                   "总人数", "参考人数"]].to_dict(orient="records")
+    process_log.append(f"科目{subject}：班级均分计算完成，共{len(table)}个班级")
+    return {"均分排名表格": table}, process_log
+
+
+def calc_single_rate(df: pd.DataFrame, subject: str, ratio: float,
+                     label: str) -> Tuple[Dict, List[str]]:
+    """
+    单次考试的达标率（优秀率 / 合格率）。
+
+    达标线：全年级该科「有成绩学生」按成绩降序排列，取前 ratio% 名次处的分数为达标线。
+    班级达标率 = 该班达标人数 / 该班参考人数（有该科成绩的学生数）。
+    分母用参考人数而非在册人数，参考率单独成一项指标，两者互补不重复。
+    """
+    process_log = []
+    valid = df[(df["参考状态"]) & (df["成绩"].notna())].copy()
+
+    if valid.empty:
+        return {f"{label}率表格": []}, [f"科目{subject}：无有效成绩记录"]
+
+    total_students = len(valid)
+    top_count = max(1, int(total_students * (ratio / 100)))
+    threshold = valid["成绩"].sort_values(ascending=False).reset_index(drop=True).iloc[
+        min(top_count, total_students) - 1]
+    process_log.append(
+        f"科目{subject}：{label}线按全年级前 {ratio}% 名次确定，"
+        f"有效人数={total_students}，阈值名次={top_count}，成绩阈值={threshold}")
+
+    rows = []
+    for class_name, class_df in valid.groupby("集团班级"):
+        ref_count = len(class_df)
+        hit_count = int((class_df["成绩"] >= threshold).sum())
+        rows.append({
+            "班级": class_name,
+            "学科": subject,
+            f"{label}人数": hit_count,
+            f"{label}率": round(hit_count / ref_count, 4) if ref_count else 0.0,
+        })
+
+    result_df = pd.DataFrame(rows)
+    result_df = result_df.sort_values(by="班级", key=lambda x: x.apply(natural_sort_key))
+    process_log.append(f"科目{subject}：{label}率计算完成，共{len(result_df)}个班级")
+    return {f"{label}率表格": result_df.to_dict(orient="records")}, process_log
+
+
+def calculate_single_reference_rate(df: pd.DataFrame, subject: str) -> Tuple[List[Dict], List[str]]:
+    """单次考试：班级参考率（参考人数 / 在册人数，口径与多次考试完全一致）"""
+    process_log = []
+    class_total_df = df.groupby("集团班级").size().reset_index(name="总人数")
+    class_reference_df = df[(df["参考状态"]) & (df["成绩"].notna())].groupby(
+        "集团班级").size().reset_index(name="参考人数")
+
+    merged_df = pd.merge(class_total_df, class_reference_df, on="集团班级", how="left")
+    merged_df["参考人数"] = merged_df["参考人数"].fillna(0).astype(int)
+    merged_df["参考率"] = (merged_df["参考人数"] / merged_df["总人数"]).round(4)
+    merged_df = merged_df.rename(columns={"集团班级": "班级"})
+
+    reference_rate_data = merged_df[["班级", "总人数", "参考人数", "参考率"]].to_dict(orient="records")
+    process_log.append(f"科目{subject}：班级参考率计算完成，共{len(reference_rate_data)}个班级")
+    return reference_rate_data, process_log
+
+
+def calculate_all_indicators_single(parsed_data: Dict[str, pd.DataFrame],
+                                    excellent_ratio: float = 20.0,
+                                    qualified_ratio: float = 80.0,
+                                    avg_weight: float = 60.0,
+                                    excellent_weight: float = 15.0,
+                                    qualified_weight: float = 15.0,
+                                    reference_weight: float = 10.0) -> Tuple[Dict, List[str]]:
+    """
+    单次考试（首次考试）指标计算。
+
+    四项指标：均分、优秀率、合格率、参考率。
+    「均分与排名」按同一项指标处理（排名即班级均分的横向位次），不单列计分。
+    与两场考试的六项指标互斥启用，由 --exam-count 决定走哪条分支。
+    """
+    process_log = []
+    result = {}
+
+    subjects = [key for key in parsed_data.keys() if key != "教师任课表"]
+    for subject in subjects:
+        process_log.append(f"=== 开始计算科目：{subject}（单次考试）===")
+        subject_df = parsed_data[subject]
+
+        avg_rank, a_log = calc_single_avg_rank(subject_df, subject)
+        excellent_rate, e_log = calc_single_rate(subject_df, subject, excellent_ratio, "优秀")
+        qualified_rate, q_log = calc_single_rate(subject_df, subject, qualified_ratio, "合格")
+        class_reference_rate, r_log = calculate_single_reference_rate(subject_df, subject)
+
+        process_log.extend(a_log + e_log + q_log + r_log)
+
+        result[subject] = {
+            "均分排名": avg_rank,
+            "优秀率": excellent_rate,
+            "合格率": qualified_rate,
+            "班级参考率": class_reference_rate,
+        }
+
+    process_log.append("=== 所有科目计算完成 ===")
+
+    teacher_scores, teacher_log = calculate_teacher_scores_single(
+        parsed_data, result, avg_weight,
+        excellent_weight, qualified_weight, reference_weight)
+    result["教师得分表"] = teacher_scores
+    process_log.extend(teacher_log)
+
+    return result, process_log
+
+
+def calculate_teacher_scores_single(parsed_data: Dict[str, pd.DataFrame], calc_results: Dict,
+                                    avg_weight: float = 60.0,
+                                    excellent_weight: float = 15.0,
+                                    qualified_weight: float = 15.0,
+                                    reference_weight: float = 10.0) -> Tuple[Dict, List[str]]:
+    """
+    单次考试的教师得分表。
+
+    指标：均分、优秀率、合格率、参考率，四项 min-max 归一到 0~100 后按权重加权。
+    「均分与排名」按同一项指标处理——排名即班级均分在同学科中的横向位次，不再单列计分。
+    归一化在「同一科目组内」进行（班主任视为独立一组），与两场考试口径一致。
+    多班任教时，四项指标一律取均值（比率类指标不可求和）。
+    """
+    process_log = []
+
+    if parsed_data.get("教师任课表") is None:
+        return {"教师得分表": []}, ["未找到教师任课表，无法生成教师得分表"]
+
+    teacher_schedule_df = parsed_data["教师任课表"].copy()
+    required_columns = ["班级", "教师姓名", "身份证号", "科目"]
+    for col in required_columns:
+        if col not in teacher_schedule_df.columns:
+            return {"教师得分表": []}, [f"教师任课表缺少必要的列：{col}"]
+
+    has_campus = "校区" in teacher_schedule_df.columns
+    if not has_campus:
+        process_log.append("教师任课表不包含校区信息，将使用空值填充")
+        teacher_schedule_df["校区"] = pd.NA
+
+    def merge_subject_indicators(subject: str) -> pd.DataFrame:
+        avg_df = pd.DataFrame(calc_results[subject]["均分排名"]["均分排名表格"])
+        exc_df = pd.DataFrame(calc_results[subject]["优秀率"]["优秀率表格"])
+        qua_df = pd.DataFrame(calc_results[subject]["合格率"]["合格率表格"])
+        ref_df = pd.DataFrame(calc_results[subject]["班级参考率"])
+
+        merged_df = avg_df.merge(exc_df, on=["班级", "学科"], how="outer")
+        merged_df = merged_df.merge(qua_df, on=["班级", "学科"], how="outer")
+        merged_df = merged_df.merge(ref_df, on="班级", how="outer")
+        return merged_df
+
+    teacher_scores = []
+
+    # 步骤1：学科教师
+    process_log.append("=== 开始处理学科教师得分（单次考试）===")
+    subjects = [key for key in calc_results.keys() if key != "教师得分表"]
+    for subject in subjects:
+        try:
+            merged_df = merge_subject_indicators(subject)
+        except (KeyError, IndexError) as e:
+            process_log.append(f"科目{subject}缺少必要的指标数据，跳过处理：{str(e)}")
+            continue
+
+        teachers = teacher_schedule_df[
+            (teacher_schedule_df["科目"] == subject) & (teacher_schedule_df["科目"] != "班主任")]
+        for _, teacher_row in teachers.iterrows():
+            class_name = teacher_row["班级"]
+            class_data = merged_df[(merged_df["班级"] == class_name) & (merged_df["学科"] == subject)]
+            if not class_data.empty:
+                teacher_scores.append({
+                    "身份证号": teacher_row["身份证号"],
+                    "姓名": teacher_row["教师姓名"],
+                    "科目": subject,
+                    "校区": teacher_row.get("校区", pd.NA),
+                    "均分": class_data.iloc[0]["均分"],
+                    "优秀率": class_data.iloc[0]["优秀率"],
+                    "合格率": class_data.iloc[0]["合格率"],
+                    "参考率": class_data.iloc[0]["参考率"],
+                    "班级": class_name,
+                })
+
+    # 步骤2：班主任（使用总分指标）
+    process_log.append("=== 开始处理班主任得分（单次考试）===")
+    if "总分" in calc_results:
+        try:
+            merged_total_df = merge_subject_indicators("总分")
+        except (KeyError, IndexError) as e:
+            process_log.append(f"总分科目缺少必要的指标数据，跳过班主任处理：{str(e)}")
+            merged_total_df = None
+
+        if merged_total_df is not None:
+            head_teachers = teacher_schedule_df[
+                teacher_schedule_df["科目"] == "班主任"].drop_duplicates(subset=["教师姓名", "身份证号"])
+            for _, teacher_row in head_teachers.iterrows():
+                teacher_name = teacher_row["教师姓名"]
+                id_card = teacher_row["身份证号"]
+                head_classes = teacher_schedule_df[
+                    (teacher_schedule_df["教师姓名"] == teacher_name) &
+                    (teacher_schedule_df["身份证号"] == id_card) &
+                    (teacher_schedule_df["科目"] == "班主任")]["班级"]
+
+                class_indicators = []
+                for class_name in head_classes:
+                    class_data = merged_total_df[
+                        (merged_total_df["班级"] == class_name) & (merged_total_df["学科"] == "总分")]
+                    if not class_data.empty:
+                        class_indicators.append({
+                            "均分": class_data.iloc[0]["均分"],
+                            "优秀率": class_data.iloc[0]["优秀率"],
+                            "合格率": class_data.iloc[0]["合格率"],
+                            "参考率": class_data.iloc[0]["参考率"],
+                        })
+
+                if class_indicators:
+                    count = len(class_indicators)
+                    teacher_scores.append({
+                        "身份证号": id_card,
+                        "姓名": teacher_name,
+                        "科目": "班主任",
+                        "校区": teacher_row.get("校区", pd.NA),
+                        "均分": round(sum(i["均分"] for i in class_indicators) / count, 2),
+                        "优秀率": round(sum(i["优秀率"] for i in class_indicators) / count, 4),
+                        "合格率": round(sum(i["合格率"] for i in class_indicators) / count, 4),
+                        "参考率": round(sum(i["参考率"] for i in class_indicators) / count, 4),
+                    })
+
+    # 步骤3：聚合与总分计算
+    process_log.append("=== 开始聚合教师得分数据（单次考试）===")
+    teacher_scores_df = pd.DataFrame(teacher_scores)
+
+    if teacher_scores_df.empty:
+        return {"教师得分表": []}, ["没有找到教师得分数据"]
+
+    aggregated_df = teacher_scores_df.groupby(
+        ["身份证号", "姓名", "科目", "校区"], dropna=False).agg(
+        均分=pd.NamedAgg(column="均分", aggfunc="mean"),
+        优秀率=pd.NamedAgg(column="优秀率", aggfunc="mean"),
+        合格率=pd.NamedAgg(column="合格率", aggfunc="mean"),
+        参考率=pd.NamedAgg(column="参考率", aggfunc="mean"),
+    ).reset_index()
+
+    aggregated_df["均分"] = aggregated_df["均分"].round(2)
+    aggregated_df["优秀率"] = aggregated_df["优秀率"].round(4)
+    aggregated_df["合格率"] = aggregated_df["合格率"].round(4)
+    aggregated_df["参考率"] = aggregated_df["参考率"].round(4)
+
+    weights = {
+        "均分": avg_weight,
+        "优秀率": excellent_weight,
+        "合格率": qualified_weight,
+        "参考率": reference_weight,
+    }
+    total_score = pd.Series(0.0, index=aggregated_df.index)
+    for _, group_idx in aggregated_df.groupby("科目", dropna=False).groups.items():
+        for col, weight in weights.items():
+            series = pd.to_numeric(aggregated_df.loc[group_idx, col], errors="coerce")
+            col_min, col_max = series.min(), series.max()
+            if pd.notna(col_min) and col_max != col_min:
+                transformed = (series - col_min) / (col_max - col_min) * 100
+            else:
+                transformed = pd.Series(50.0, index=group_idx)
+            if weight < 0:
+                transformed = 100 - transformed
+            total_score.loc[group_idx] += transformed * (abs(weight) / 100)
+
+    aggregated_df["总分"] = total_score.round(2)
+
+    teacher_scores_table = aggregated_df[[
+        "身份证号", "姓名", "科目", "校区", "均分",
+        "优秀率", "合格率", "参考率", "总分"
+    ]].to_dict(orient="records")
+
+    process_log.append(f"教师得分表生成完成（单次考试），共{len(teacher_scores_table)}条记录")
+    return {"教师得分表": teacher_scores_table}, process_log
 
 
 def calculate_all_indicators(parsed_data: Dict[str, pd.DataFrame],
@@ -836,13 +1281,149 @@ def export_result_excel(result: Dict, parsed_data: Dict, output_path: str,
     return export_log
 
 
-def make_template(output_path: str) -> None:
-    """生成空白 Excel 模板（成绩表 + 教师任课表表头）"""
-    grade_headers = ["考号", "姓名", "集团班级",
-                     "语文1", "数学1", "英语1", "物理1", "化学1", "生物1",
-                     "政治1", "历史1", "地理1", "总分1",
-                     "语文2", "数学2", "英语2", "物理2", "化学2", "生物2",
-                     "政治2", "历史2", "地理2", "总分2"]
+def export_result_excel_single(result: Dict, parsed_data: Dict, output_path: str,
+                               exam_date: str = "", cohort: str = "",
+                               semester: str = "", exam_name: str = "") -> List[str]:
+    """导出单次考试（首次考试）结果 Excel：均分与排名 / 优秀率 / 合格率 / 参考率 / 教师得分表"""
+    export_log = []
+    exam_info = build_exam_info(exam_date, cohort, semester, exam_name)
+
+    teacher_schedule_df = parsed_data.get("教师任课表")
+    has_teacher_schedule = teacher_schedule_df is not None and not teacher_schedule_df.empty
+
+    def get_teacher_info(class_name, subject):
+        """根据班级和科目查找教师信息；总分对应班主任"""
+        if not has_teacher_schedule:
+            return {"教师姓名": "", "校区": ""}
+        if subject == "总分":
+            teacher_row = teacher_schedule_df[
+                (teacher_schedule_df["班级"] == class_name) & (teacher_schedule_df["科目"] == "班主任")]
+        else:
+            teacher_row = teacher_schedule_df[
+                (teacher_schedule_df["班级"] == class_name) &
+                (teacher_schedule_df["科目"] == subject) &
+                (teacher_schedule_df["科目"] != "班主任")]
+        if not teacher_row.empty:
+            info = teacher_row.iloc[0]
+            campus = info.get("校区", "")
+            return {"教师姓名": info.get("教师姓名", ""),
+                    "校区": "" if pd.isna(campus) else campus}
+        return {"教师姓名": "", "校区": ""}
+
+    all_subjects = [key for key in result.keys()
+                    if key not in ["教师任课表", "教师得分表"]]
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        sheet_count = 0
+
+        # 表1：均分汇总（排名不单列为指标——排名即班级均分的横向位次，与均分属同一项指标）
+        avg_rows = []
+        for subject in all_subjects:
+            for record in result[subject]["均分排名"]["均分排名表格"]:
+                teacher_info = get_teacher_info(record["班级"], subject)
+                avg_rows.append({
+                    "考试信息": exam_info, "班级": record["班级"], "学科": subject,
+                    "教师姓名": teacher_info["教师姓名"], "校区": teacher_info["校区"],
+                    "均分": record.get("均分"),
+                    "总人数": record.get("总人数"), "参考人数": record.get("参考人数"),
+                })
+        if avg_rows:
+            avg_df = pd.DataFrame(avg_rows)
+            # 均分排名为本表内部的行序（与各表末列口径一致），非独立评价指标
+            avg_df["均分排名"] = avg_df.groupby("学科")["均分"].rank(
+                ascending=False, method="min").astype(int)
+            avg_df = avg_df[
+                ["考试信息", "班级", "学科", "教师姓名", "校区", "均分", "均分排名",
+                 "总人数", "参考人数"]]
+            avg_df.to_excel(writer, sheet_name="均分汇总", index=False)
+            sheet_count += 1
+            export_log.append("已生成工作表：均分汇总")
+
+        # 表2、表3：优秀率 / 合格率汇总
+        rate_specs = [
+            ("优秀率", "优秀率表格", "优秀人数", "优秀率", "优秀率汇总"),
+            ("合格率", "合格率表格", "合格人数", "合格率", "合格率汇总"),
+        ]
+        for indicator_key, table_key, count_col, rate_col, sheet_name in rate_specs:
+            rows = []
+            for subject in all_subjects:
+                for record in result[subject][indicator_key][table_key]:
+                    teacher_info = get_teacher_info(record["班级"], subject)
+                    rows.append({
+                        "考试信息": exam_info, "班级": record["班级"], "学科": subject,
+                        "教师姓名": teacher_info["教师姓名"], "校区": teacher_info["校区"],
+                        count_col: record.get(count_col), rate_col: record.get(rate_col),
+                    })
+            if not rows:
+                continue
+            merged_df = pd.DataFrame(rows)
+            merged_df["排名"] = merged_df.groupby("学科")[rate_col].rank(
+                ascending=False, method="min").astype(int)
+            merged_df = merged_df[
+                ["考试信息", "班级", "学科", "教师姓名", "校区", count_col, rate_col, "排名"]]
+            merged_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            sheet_count += 1
+            export_log.append(f"已生成工作表：{sheet_name}")
+
+        # 表4：参考率汇总（使用总分的班级参考率）
+        if "总分" in result and result["总分"]["班级参考率"]:
+            reference_rate_rows = []
+            for record in result["总分"]["班级参考率"]:
+                teacher_info = get_teacher_info(record["班级"], "总分")
+                reference_rate_rows.append({
+                    "考试信息": exam_info, "班级": record["班级"],
+                    "班主任": teacher_info["教师姓名"], "校区": teacher_info["校区"],
+                    "总人数": record.get("总人数"), "参考人数": record.get("参考人数"),
+                    "参考率": record.get("参考率"),
+                })
+            reference_rate_df = pd.DataFrame(reference_rate_rows)
+            reference_rate_df["排名"] = reference_rate_df["参考率"].rank(
+                ascending=False, method="min").astype(int)
+            reference_rate_df.to_excel(writer, sheet_name="参考率汇总", index=False)
+            sheet_count += 1
+            export_log.append("已生成工作表：参考率汇总")
+
+        # 表5：教师得分表
+        if result.get("教师得分表", {}).get("教师得分表"):
+            teacher_scores_df = pd.DataFrame(result["教师得分表"]["教师得分表"])
+            teacher_scores_df.insert(0, "考试信息", exam_info)
+            if "科目" in teacher_scores_df.columns:
+                teacher_scores_df["得分排名"] = teacher_scores_df.groupby("科目")["总分"].rank(
+                    ascending=False, method="min").astype(int)
+            else:
+                teacher_scores_df["得分排名"] = teacher_scores_df["总分"].rank(
+                    ascending=False, method="min").astype(int)
+            columns = list(teacher_scores_df.columns)
+            columns.remove("得分排名")
+            columns.insert(columns.index("总分") + 1, "得分排名")
+            teacher_scores_df = teacher_scores_df[columns]
+            teacher_scores_df.to_excel(writer, sheet_name="教师得分表", index=False)
+            sheet_count += 1
+            export_log.append("已生成工作表：教师得分表")
+
+        if sheet_count == 0:
+            pd.DataFrame({"考试信息": [exam_info], "说明": ["没有可生成的分析结果数据"]}).to_excel(
+                writer, sheet_name="无数据", index=False)
+            export_log.append("没有可生成的分析结果数据")
+
+    return export_log
+
+
+def make_template(output_path: str, single: bool = False) -> None:
+    """
+    生成空白 Excel 模板（成绩表 + 教师任课表表头）。
+
+    single=True 时只生成第一场（首次考试）需要的科目列，不含 '2' 后缀列。
+    """
+    grade_headers = ["考号", "姓名", "集团班级"]
+    if single:
+        grade_headers += ["语文1", "数学1", "英语1", "物理1", "化学1", "生物1",
+                          "政治1", "历史1", "地理1", "总分1"]
+    else:
+        grade_headers += ["语文1", "数学1", "英语1", "物理1", "化学1", "生物1",
+                          "政治1", "历史1", "地理1", "总分1",
+                          "语文2", "数学2", "英语2", "物理2", "化学2", "生物2",
+                          "政治2", "历史2", "地理2", "总分2"]
     teacher_headers = ["教师姓名", "校区", "科目", "班级", "身份证号"]
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         pd.DataFrame(columns=grade_headers).to_excel(writer, sheet_name="成绩表", index=False)
@@ -856,15 +1437,24 @@ def main():
     parser.add_argument("-o", "--output", help="输出结果 Excel 路径（默认在输入文件旁生成）")
     parser.add_argument("--template", help="仅生成空白模板到指定路径后退出")
     parser.add_argument("--excellent-ratio", type=float, default=20.0,
-                        help="优秀比例（全年级排名前 X%%，默认 20）")
-    parser.add_argument("--qualified-ratio", type=float, default=75.0,
-                        help="出库比例（全年级排名前 X%%，默认 75）")
-    parser.add_argument("--rank-weight", type=float, default=20.0, help="排名正负权重，默认 20")
-    parser.add_argument("--t-diff-weight", type=float, default=20.0, help="T分差权重，默认 20")
-    parser.add_argument("--avg-weight", type=float, default=20.0, help="均分权重，默认 20")
-    parser.add_argument("--excellent-weight", type=float, default=15.0, help="优秀人数权重，默认 15")
-    parser.add_argument("--qualified-weight", type=float, default=15.0, help="出库人数权重，默认 15")
-    parser.add_argument("--reference-weight", type=float, default=10.0, help="参考率权重，默认 10")
+                        help="优秀比例（全年级排名前 X%%）。默认：两场 20，单次 20")
+    parser.add_argument("--qualified-ratio", type=float, default=None,
+                        help="合格/出库比例（全年级排名前 X%%）。默认：两场 75，单次 80")
+    parser.add_argument("--rank-weight", type=float, default=None,
+                        help="排名权重：两场=排名正负；单次考试下不适用（排名与均分为同一项指标）")
+    parser.add_argument("--t-diff-weight", type=float, default=None,
+                        help="T分差权重（仅两场考试生效）。默认 20")
+    parser.add_argument("--avg-weight", type=float, default=None,
+                        help="均分权重（单次考试下含「均分与排名」合并权重）。默认：两场 20，单次 40")
+    parser.add_argument("--excellent-weight", type=float, default=None,
+                        help="优秀人数（两场）/ 优秀率（单次）的权重。默认：两场 15，单次 25")
+    parser.add_argument("--qualified-weight", type=float, default=None,
+                        help="出库人数（两场）/ 合格率（单次）的权重。默认：两场 15，单次 25")
+    parser.add_argument("--reference-weight", type=float, default=None,
+                        help="参考率权重。默认 10")
+    parser.add_argument("--exam-count", choices=["1", "2", "auto"], default="auto",
+                        help="考试场次数：1=首次考试（仅一次成绩，四项指标）；"
+                             "2=两场考试对比（六项指标）；auto=按成绩表列名自动识别（默认）")
     parser.add_argument("--exam-date", default="", help="考试日期，格式 YYYY-MM-DD")
     parser.add_argument("--cohort", default="", help="届别，如 2028")
     parser.add_argument("--semester", default="", help="学期：1=第一学期，2=第二学期")
@@ -873,6 +1463,9 @@ def main():
     parser.add_argument("--parse-filename", default=None,
                         help="仅解析指定文件路径的文件名是否符合标准格式（YYYY-MM-DD[_届别[_学期[_考试名称]]].xlsx），"
                              "输出 JSON 解析结果或 'non-standard' 后退出")
+    parser.add_argument("--detect", default=None,
+                        help="仅检测指定文件的考试场次与科目列（输出 JSON）后退出，"
+                             "用于判断该用首次考试口径还是两场对比口径")
     parser.add_argument("--db", default=DEFAULT_DB,
                         help="SQLite 数据库路径（默认 skill_dir/data/analysis.db）")
     parser.add_argument("--no-db", action="store_true", help="不将结果写入 SQLite 数据库")
@@ -882,13 +1475,35 @@ def main():
     args = parser.parse_args()
 
     if args.template:
-        make_template(args.template)
-        print(f"模板已生成：{args.template}")
+        make_template(args.template, single=(args.exam_count == "1"))
+        print(f"模板已生成：{args.template}"
+              + ("（首次考试模板，仅含第一场科目列）" if args.exam_count == "1" else ""))
         return
 
     if args.parse_filename:
         parsed = parse_exam_filename(args.parse_filename)
         print(json.dumps(parsed, ensure_ascii=False) if parsed else "non-standard")
+        return
+
+    if args.detect:
+        excel_file = pd.ExcelFile(args.detect)
+        if "成绩表" not in excel_file.sheet_names:
+            raise ValueError("Excel 文件中缺少「成绩表」工作表")
+        df = excel_file.parse(sheet_name="成绩表")
+        count = detect_exam_count(df)
+        first_cols = [c for c in df.columns if c.endswith("1") and c != "总分1"]
+        second_cols = [c for c in df.columns if c.endswith("2") and c != "总分2"]
+        if count == 1 and not first_cols:
+            first_cols = [c for c in df.columns
+                          if c not in set(BASIC_COLUMNS) | {"总分", "总分1"}]
+        print(json.dumps({
+            "exam_count": count,
+            "mode": "首次考试（四项指标）" if count == 1 else "两场考试对比（六项指标）",
+            "rows": len(df),
+            "first_subject_columns": first_cols,
+            "second_subject_columns": second_cols,
+            "has_total_column": any(c in df.columns for c in ("总分", "总分1", "总分2")),
+        }, ensure_ascii=False))
         return
 
     if args.serve:
@@ -909,44 +1524,102 @@ def main():
                   "在由 WorkBuddy 调用时，应先向用户询问考试名称后再分析。",
                   file=sys.stderr)
 
-    # 1. 解析
-    parsed_data, parse_log = parse_excel(args.input)
+    # 1. 解析（考试场次：显式指定优先，否则按列名自动识别）
+    requested_count = 0 if args.exam_count == "auto" else int(args.exam_count)
+    parsed_data, parse_log, mode = parse_excel(args.input, requested_count)
     for line in parse_log:
         print(line)
 
-    # 2. 计算
-    result, calc_log = calculate_all_indicators(
-        parsed_data,
-        excellent_ratio=args.excellent_ratio,
-        qualified_ratio=args.qualified_ratio,
-        rank_weight=args.rank_weight,
-        t_diff_weight=args.t_diff_weight,
-        avg_weight=args.avg_weight,
-        excellent_weight=args.excellent_weight,
-        qualified_weight=args.qualified_weight,
-        reference_weight=args.reference_weight,
-    )
+    # 2. 参数默认值（两种模式各有一套默认值，未显式传参时按模式自动套用）
+    if mode == 1:
+        ratio_defaults = SINGLE_DEFAULT_RATIOS
+        weight_defaults = SINGLE_DEFAULT_WEIGHTS
+    else:
+        ratio_defaults = DUAL_DEFAULT_RATIOS
+        weight_defaults = DUAL_DEFAULT_WEIGHTS
+
+    excellent_ratio = (args.excellent_ratio if args.excellent_ratio is not None
+                       else ratio_defaults["excellent"])
+    qualified_ratio = (args.qualified_ratio if args.qualified_ratio is not None
+                       else ratio_defaults["qualified"])
+    rank_weight = (args.rank_weight if args.rank_weight is not None
+                   else weight_defaults.get("rank", 0.0))
+    t_diff_weight = (args.t_diff_weight if args.t_diff_weight is not None
+                     else weight_defaults.get("t_diff", 0.0))
+    avg_weight = args.avg_weight if args.avg_weight is not None else weight_defaults["avg"]
+    excellent_weight = (args.excellent_weight if args.excellent_weight is not None
+                        else weight_defaults["excellent"])
+    qualified_weight = (args.qualified_weight if args.qualified_weight is not None
+                        else weight_defaults["qualified"])
+    reference_weight = (args.reference_weight if args.reference_weight is not None
+                        else weight_defaults["reference"])
+
+    if mode == 1:
+        # 首次考试口径为四项指标，「均分与排名」合为均分一项，排名不单独计分
+        if args.rank_weight is not None:
+            print("提示：首次考试口径下「排名」与「均分」为同一项指标，"
+                  "--rank-weight 不再生效，已忽略。")
+        print(f"参数：优秀比例={excellent_ratio}%，合格比例={qualified_ratio}%，"
+              f"权重=均分{avg_weight}/优秀率{excellent_weight}/"
+              f"合格率{qualified_weight}/参考率{reference_weight}")
+    else:
+        print(f"参数：优秀比例={excellent_ratio}%，合格/出库比例={qualified_ratio}%，"
+              f"权重=排名正负{rank_weight}/T分差{t_diff_weight}/均分{avg_weight}/"
+              f"优秀{excellent_weight}/出库{qualified_weight}/参考率{reference_weight}")
+
+    # 3. 计算
+    if mode == 1:
+        result, calc_log = calculate_all_indicators_single(
+            parsed_data,
+            excellent_ratio=excellent_ratio,
+            qualified_ratio=qualified_ratio,
+            avg_weight=avg_weight,
+            excellent_weight=excellent_weight, qualified_weight=qualified_weight,
+            reference_weight=reference_weight)
+    else:
+        result, calc_log = calculate_all_indicators(
+            parsed_data,
+            excellent_ratio=excellent_ratio,
+            qualified_ratio=qualified_ratio,
+            rank_weight=rank_weight,
+            t_diff_weight=t_diff_weight,
+            avg_weight=avg_weight,
+            excellent_weight=excellent_weight,
+            qualified_weight=qualified_weight,
+            reference_weight=reference_weight,
+        )
 
     subjects = [k for k in result.keys() if k != "教师得分表"]
-    class_count = len(result[subjects[0]]["T分差"]["T分差表格"]) if subjects else 0
+    if mode == 1:
+        class_count = (len(result[subjects[0]]["均分排名"]["均分排名表格"])
+                       if subjects else 0)
+    else:
+        class_count = len(result[subjects[0]]["T分差"]["T分差表格"]) if subjects else 0
     teacher_count = len(result["教师得分表"].get("教师得分表", []))
-    print(f"计算完成：科目{len(subjects)}个（含总分），班级{class_count}个，"
+    mode_text = "单次考试（四项指标）" if mode == 1 else "两场考试对比（六项指标）"
+    print(f"计算完成：{mode_text}，科目{len(subjects)}个（含总分），班级{class_count}个，"
           f"教师得分记录{teacher_count}条")
 
-    # 3. 导出
+    # 4. 导出
     output_path = args.output
     if not output_path:
         base = re.sub(r"\.(xlsx|xls)$", "", args.input, flags=re.IGNORECASE)
         output_path = f"{base}_分析结果.xlsx"
-    export_log = export_result_excel(
-        result, parsed_data, output_path,
-        exam_date=args.exam_date, cohort=args.cohort,
-        semester=args.semester, exam_name=args.exam_name)
+    if mode == 1:
+        export_log = export_result_excel_single(
+            result, parsed_data, output_path,
+            exam_date=args.exam_date, cohort=args.cohort,
+            semester=args.semester, exam_name=args.exam_name)
+    else:
+        export_log = export_result_excel(
+            result, parsed_data, output_path,
+            exam_date=args.exam_date, cohort=args.cohort,
+            semester=args.semester, exam_name=args.exam_name)
     for line in export_log:
         print(line)
     print(f"结果已导出：{output_path}")
 
-    # 3.5 落库（SQLite 持久化，便于跨考试查询与可视化）
+    # 5. 落库（SQLite 持久化，便于跨考试查询与可视化）
     if not args.no_db:
         try:
             from db_store import save_exam
@@ -958,14 +1631,16 @@ def main():
                 "cohort": args.cohort,
                 "semester": args.semester,
                 "exam_name": args.exam_name,
+                "exam_count": mode,
             }
-            exam_id = save_exam(args.db, exam_meta, result, parsed_data, args.input)
+            exam_id = save_exam(args.db, exam_meta, result, parsed_data, args.input,
+                                exam_count=mode)
             print(f"结果已写入数据库（exam_id={exam_id}）：{args.db}")
             print("提示：运行 `python score_analysis.py --serve` 可打开本地查询页面查看图表。")
         except Exception as e:
             print(f"数据库写入失败（不影响 Excel 结果）：{e}", file=sys.stderr)
 
-    # 4. 日志（可选）
+    # 6. 日志（可选）
     if args.log:
         with open(args.log, "w", encoding="utf-8") as f:
             f.write("\n".join(parse_log + calc_log))
