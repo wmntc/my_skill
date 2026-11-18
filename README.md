@@ -1,12 +1,12 @@
 # my_skill
 
-个人技能集仓库，收录 4 个自建 WorkBuddy Skill，当前版本 **1.1**。
+个人技能集仓库，收录 4 个自建 WorkBuddy Skill，当前版本 **1.3**。
 
 | 技能 | 目录 | 说明 |
 |---|---|---|
 | 实验课程设计大师 | [`skills/实验课程设计大师`](skills/实验课程设计大师) | 多模型教学设计生成器，一次交付 HTML 教案 + A4 PDF + Markdown，支持 BOPPPS / 5E / 对分课堂 PAD / GRR / UbD / ADDIE / PBL·CBL 七种模型 |
 | 成果案例制作器 | [`skills/achievement-case-maker`](skills/achievement-case-maker) | 把教师零散材料自动整理成结构统一的成果案例成品文件夹 |
-| 呼市实验中学成绩分析 | [`skills/呼市实验中学成绩分析`](skills/呼市实验中学成绩分析) | 班级指标与教师绩效算分，双口径：两场考试对比（六项指标）／首次考试单场（四项指标），含 SQLite 持久化与本地可视化查询页 |
+| 呼市实验中学成绩分析 | [`skills/呼市实验中学成绩分析`](skills/呼市实验中学成绩分析) | 班级指标与教师绩效算分，三口径：两场考试对比（六项指标）／首次考试单场（四项指标）／混合口径（逐科目分流），纯 Excel 输入输出 |
 | 公文格式排版 | [`skills/gov-doc-formatter`](skills/gov-doc-formatter) | 文本转 GB/T 9704-2012 标准公文 .docx，内嵌仿宋/楷体/方正小标宋字体 |
 
 ## 目录结构
@@ -19,7 +19,7 @@ my_skill/
 └── skills/
     ├── 实验课程设计大师/       SKILL.md + scripts/ + references/ + assets/
     ├── achievement-case-maker/ SKILL.md + scripts/ + references/
-    ├── 呼市实验中学成绩分析/    SKILL.md + scripts/ + web/
+    ├── 呼市实验中学成绩分析/    SKILL.md + scripts/
     └── gov-doc-formatter/      SKILL.md + scripts/ + references/ + assets/fonts/
 ```
 
@@ -36,9 +36,27 @@ cp -r my_skill/skills/<技能名> ~/.workbuddy/skills/
 
 ## 版本
 
-当前版本 **1.1**，对应 Git 标签 [`v1.1`](https://github.com/wmntc/my_skill/releases/tag/v1.1)。
+当前版本 **1.3**，对应 Git 标签 [`v1.3`](https://github.com/wmntc/my_skill/releases/tag/v1.3)。
 
 各技能的版本号记录在对应 `SKILL.md` 的 frontmatter `version` 字段中。
+
+### v1.3 变更
+
+**呼市实验中学成绩分析**（`1.2` → `1.3`）移除网页与数据库依赖，回归纯 Excel 工具：
+
+- 删除 `scripts/db_store.py`、`scripts/web_app.py`、`web/index.html` 及全部落库/服务代码与 CLI 参数（`--db/--no-db/--serve/--port`）。
+- 保留三种口径的完整算分与多工作表导出能力（首次考试四项指标、两场对比六项指标、混合口径逐科目分流）。
+- 技能目录只含 `SKILL.md` 与 `scripts/score_analysis.py`；依赖仅 `pandas` + `openpyxl`。
+- 已落库的 `data/analysis.db` 不会被代码访问，也不会被技能删除。
+
+### v1.2 变更
+
+**呼市实验中学成绩分析**（`1.1` → `1.2`）新增混合口径（逐科目分流）：
+
+- 有基准成绩的科目走两场对比六项指标；无基准成绩的科目（如初二新开物理）走首次考试四项指标，且不计入总分。
+- 总分按「含有基准成绩的科目之和」重算，弃用掺入无基准科目的原生总分列。
+- 支持 `--subject-mode` 手工覆盖个别科目口径，以及 5 个 `single-*` 专用参数。
+- 三种口径的结果 Excel 分别含 5 / 7 / 9 张工作表。
 
 ### v1.1 变更
 
@@ -54,5 +72,5 @@ cp -r my_skill/skills/<技能名> ~/.workbuddy/skills/
 
 ## 说明
 
-- `skills/呼市实验中学成绩分析/data/` 为运行时生成的 SQLite 数据库（含教师姓名、身份证号等个人信息），**不入库**，由技能首次运行时自动创建。
+- `skills/呼市实验中学成绩分析/` 为纯 Excel 工具，不写数据库、不启服务、不产生需要联网的依赖。
 - `gov-doc-formatter/assets/fonts/` 收录了三套公文字体文件，用于在 docx 中嵌入字体，保证任意设备打开不缺字。

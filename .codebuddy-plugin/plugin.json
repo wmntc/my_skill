@@ -1,9 +1,9 @@
 {
   "name": "my_skill",
-  "version": "1.1",
-  "description": "个人技能集：教学设计生成、成果案例整理、成绩分析算分（支持两场对比与首次考试双口径）、公文格式排版四个 WorkBuddy Skill。",
-  "description_zh": "个人技能集：教学设计生成、成果案例整理、成绩分析算分（支持两场对比与首次考试双口径）、公文格式排版四个 WorkBuddy Skill。",
-  "description_en": "Personal skill collection: four WorkBuddy Skills for lesson-plan generation, achievement-case packaging, exam score analysis (dual-mode: multi-exam comparison and first-exam-only), and official document formatting.",
+  "version": "1.3",
+  "description": "个人技能集：教学设计生成、成果案例整理、成绩分析算分（支持两场对比、首次考试与混合三口径，纯 Excel 工具）、公文格式排版四个 WorkBuddy Skill。",
+  "description_zh": "个人技能集：教学设计生成、成果案例整理、成绩分析算分（支持两场对比、首次考试与混合三口径，纯 Excel 工具）、公文格式排版四个 WorkBuddy Skill。",
+  "description_en": "Personal skill collection: four WorkBuddy Skills for lesson-plan generation, achievement-case packaging, exam score analysis (three modes, Excel-only), and official document formatting.",
   "author": {
     "name": "wmntc"
   },
